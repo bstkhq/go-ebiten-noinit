@@ -1,0 +1,56 @@
+name: test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  # This package depends on compiler, linker and Ebitengine internals that can
+  # drift without anything here changing.
+  schedule:
+    - cron: "0 6 * * 1"
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        go: ["1.24", "1.25", "stable"]
+        ebiten: ["v2.8.0", "v2.9.9", "v2.10.0-alpha.13"]
+    name: go ${{ matrix.go }} / ebiten ${{ matrix.ebiten }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ matrix.go }}
+
+      # Ebitengine needs these to build on Linux even though nothing here opens
+      # a display.
+      - name: Install Ebitengine build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgl1-mesa-dev libxcursor-dev libxi-dev \
+            libxinerama-dev libxrandr-dev libxxf86vm-dev libasound2-dev pkg-config
+
+      - name: Select Ebitengine ${{ matrix.ebiten }}
+        run: go get github.com/hajimehoshi/ebiten/v2@${{ matrix.ebiten }}
+
+      - name: Check formatting
+        run: test -z "$(gofmt -l .)" || { gofmt -l .; exit 1; }
+
+      # testdata is invisible to ./... , so vet it by path.
+      - name: Vet
+        run: |
+          go vet ./...
+          go vet ./testdata/blank ./testdata/indirect
+
+      # DISPLAY is unset on the runner anyway; the tests set it themselves.
+      - name: Test
+        run: go test -count=1 -v ./...
+
+      - name: Test with the race detector
+        run: go test -count=1 -race ./...
+
+      - name: Test as a position independent executable
+        run: go test -count=1 -buildmode=pie ./...
