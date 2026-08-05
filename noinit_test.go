@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 
@@ -72,8 +74,80 @@ func TestImportWithDisplayStillSkipsUI(t *testing.T) {
 	}
 }
 
+// TestBlankEbitenImport links a separate binary which imports Ebitengine and
+// calls nothing. This test package cannot stand in for it: it reaches
+// Ebitengine through testdata/indirect, and that alone keeps the methods the
+// replacement initializer needs out of the linker's dead code pass. A program
+// which only links Ebitengine keeps nothing, and calling a pruned method
+// aborts with "unreachable method called".
+func TestBlankEbitenImport(t *testing.T) {
+	if testing.Short() {
+		t.Skip("linking a second binary is too slow for -short")
+	}
+
+	exe := filepath.Join(t.TempDir(), "blank")
+	build := exec.Command("go", "build", "-o", exe, "./testdata/blank")
+	if out, err := build.CombinedOutput(); err != nil {
+		t.Fatalf("building the blank-import program: %v\n%s", err, out)
+	}
+
+	cmd := exec.Command(exe)
+	cmd.Env = withoutEnv(os.Environ(), "DISPLAY")
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("a program which only links Ebitengine must still start: %v\n%s", err, out)
+	}
+	if !strings.Contains(string(out), "package loaded") {
+		t.Fatalf("helper did not reach main; output:\n%s", out)
+	}
+}
+
+// TestImportsStayAheadOfEbiten guards the invariant that decides the
+// initialization order.
+//
+// Go's linker schedules inittasks in dependency order and breaks ties by
+// symbol name. This package only wins that tie-break if it is schedulable by
+// the time internal/ui is, which holds as long as everything it imports is
+// something internal/ui already reaches. An import internal/ui does not have
+// could leave this package waiting while internal/ui runs, and the failure
+// would be silent on a machine that has a display.
+func TestImportsStayAheadOfEbiten(t *testing.T) {
+	if testing.Short() {
+		t.Skip("listing dependencies shells out to go list")
+	}
+
+	const self = "github.com/bstkhq/go-ebiten-noinit"
+	ebitenDeps := listDeps(t, "github.com/hajimehoshi/ebiten/v2/internal/ui")
+
+	for _, dep := range listDeps(t, self) {
+		if dep == self {
+			continue
+		}
+		if !slices.Contains(ebitenDeps, dep) {
+			t.Errorf("this package imports %q, which Ebitengine's internal/ui does not reach; "+
+				"that can make it initialize after Ebitengine", dep)
+		}
+	}
+}
+
+func listDeps(t *testing.T, pkg string) []string {
+	t.Helper()
+	out, err := exec.Command("go", "list", "-deps", pkg).Output()
+	if err != nil {
+		t.Fatalf("listing the dependencies of %s: %v", pkg, err)
+	}
+	return strings.Fields(string(out))
+}
+
+// assertMinimalUI checks state which Ebitengine only ever reaches by
+// initializing GLFW. It deliberately does not look at the graphics library:
+// that is chosen in RunGame, so it reads as unknown whether or not this
+// package did anything.
 func assertMinimalUI(t *testing.T) {
 	t.Helper()
+	if !indirect.MonitorUnset() {
+		t.Fatal("a monitor was selected, so Ebitengine initialized GLFW")
+	}
 	library, unknown := indirect.UIState()
 	if library != unknown {
 		t.Fatalf("graphics library = %d, want unknown (%d)", library, unknown)

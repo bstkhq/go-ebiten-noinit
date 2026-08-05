@@ -17,3 +17,10 @@ func UIState() (graphicsLibrary, unknownGraphicsLibrary int) {
 	ebiten.ReadDebugInfo(&info)
 	return int(info.GraphicsLibrary), int(ebiten.GraphicsLibraryUnknown)
 }
+
+// MonitorUnset reports whether Ebitengine still has no monitor. Ebitengine
+// picks the initial monitor while it initializes GLFW and nowhere else, which
+// makes this a signal that does not depend on whether a display exists.
+func MonitorUnset() bool {
+	return ebiten.Monitor() == nil
+}

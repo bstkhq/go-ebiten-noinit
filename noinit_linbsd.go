@@ -2,10 +2,17 @@
 
 package noinit
 
+// The imports below must stay a subset of what internal/ui reaches. Go's
+// linker schedules inittasks in dependency order and breaks ties by symbol
+// name, which is what makes this package initialize before Ebitengine. An
+// import which internal/ui does not have could leave this package
+// unschedulable while internal/ui is ready, and silently reverse that order.
 import (
 	"image"
 	"reflect"
 	"runtime"
+	"strings"
+	"sync/atomic"
 	"unsafe"
 )
 
@@ -33,6 +40,27 @@ func uiInit()
 //go:linkname theUI github.com/hajimehoshi/ebiten/v2/internal/ui.theUI
 var theUI unsafe.Pointer
 
+// The three Ebitengine methods below are called through go:linkname rather
+// than through reflect. A method which is only ever reached by reflection is
+// unreferenced as far as the linker is concerned: its dead code pass prunes
+// it, redirects its method table entry to runtime.unreachableMethod and drops
+// its method type. Calling one then aborts the process, and even inspecting
+// one crashes inside reflect. That is exactly the shape of a binary this
+// package exists for, one which links Ebitengine and never calls it.
+//
+// A renamed or removed method fails at link time. A changed signature would
+// not, so initializeWithoutUI checks what each call did to the fields it is
+// supposed to touch.
+
+//go:linkname uiSetScreenClearedEveryFrame github.com/hajimehoshi/ebiten/v2/internal/ui.(*UserInterface).SetScreenClearedEveryFrame
+func uiSetScreenClearedEveryFrame(u unsafe.Pointer, cleared bool)
+
+//go:linkname uiNewImage github.com/hajimehoshi/ebiten/v2/internal/ui.(*UserInterface).NewImage
+func uiNewImage(u unsafe.Pointer, width, height, imageType int) unsafe.Pointer
+
+//go:linkname uiImageWritePixels github.com/hajimehoshi/ebiten/v2/internal/ui.(*Image).WritePixels
+func uiImageWritePixels(i unsafe.Pointer, pix []byte, region image.Rectangle)
+
 // typesByString has an intentional linkname handshake in package reflect.
 // Its real result is []*abi.Type; pointers have the same slice representation
 // as unsafe.Pointer, which lets this package use it without importing an
@@ -49,8 +77,38 @@ func init() {
 		return
 	}
 
-	if !replaceInitializer(&uiInitTask, functionPC(uiInit), functionPC(initializeWithoutUI)) {
+	target := functionPC(uiInit)
+	verifyUIInitializer(target)
+
+	if !replaceInitializer(&uiInitTask, target, functionPC(initializeWithoutUI)) {
 		panic("noinit: Ebitengine's UI initializer was not found; unsupported Ebitengine or Go version")
+	}
+}
+
+// uiInitFile is where Ebitengine declares the initializer this package
+// replaces. Matched as a suffix, since the prefix is a module cache path under
+// -trimpath and an absolute path without it. The directory is part of it so
+// that some other ui.go cannot match.
+const uiInitFile = "/internal/ui/ui.go"
+
+// verifyUIInitializer checks that internal/ui.init.0 is still the init
+// function declared in internal/ui/ui.go.
+//
+// Which init function the compiler names init.0 depends on the order of the
+// file names in the package, so a new file sorting before ui.go silently takes
+// the name. Ebitengine v2.10.0-alpha.13 added internal/ui/api_darwin.go and it
+// did exactly that on darwin. Without this check the same change in the Linux
+// and BSD build would move the patch onto an unrelated initializer, leaving the
+// real one to open X11.
+func verifyUIInitializer(pc uintptr) {
+	fn := runtime.FuncForPC(pc)
+	if fn == nil {
+		panic("noinit: Ebitengine's UI initializer has no symbol information")
+	}
+	// The file name survives -trimpath and -ldflags=-w; both keep the pclntab.
+	if file, _ := fn.FileLine(pc); !strings.HasSuffix(file, uiInitFile) {
+		panic("noinit: " + fn.Name() + " is declared in " + file + ", not " + uiInitFile +
+			"; unsupported Ebitengine version")
 	}
 }
 
@@ -91,48 +149,91 @@ func functionPC(fn func()) uintptr {
 // makes that load-time image allocation work without pretending that a graphics
 // backend exists.
 //
+// Every linknamed call below is checked by its effect on a field rather than
+// by its signature. Reflection cannot inspect these methods either: a pruned
+// method has no method type left, so reflect.Value.MethodByName crashes
+// dereferencing it. Fields are part of the struct descriptor and always there.
+//
 //go:noinline
 func initializeWithoutUI() {
 	u := reflect.New(userInterfaceType())
+	uPointer := u.UnsafePointer()
 
-	setCleared := requiredMethod(u, "SetScreenClearedEveryFrame")
-	setCleared.Call([]reflect.Value{reflect.ValueOf(true)})
+	uiSetScreenClearedEveryFrame(uPointer, true)
+	if atomicWordOf(u.Elem(), "isScreenClearedEveryFrame").IsZero() {
+		panic("noinit: Ebitengine SetScreenClearedEveryFrame had no effect; unsupported Ebitengine version")
+	}
 
 	// GraphicsLibraryUnknown is 1 in the supported Ebitengine versions. Zero
 	// means Auto, which would falsely report that backend selection had not
 	// happened yet.
-	graphicsLibrary := requiredField(u.Elem(), "graphicsLibrary")
-	graphicsLibraryValue := reflect.NewAt(graphicsLibrary.Type(), unsafe.Pointer(graphicsLibrary.UnsafeAddr()))
-	requiredMethod(graphicsLibraryValue, "Store").Call([]reflect.Value{reflect.ValueOf(int32(1))})
-
-	newImage := requiredMethod(u, "NewImage")
-	if newImage.Type().NumIn() != 3 {
-		panic("noinit: unexpected Ebitengine NewImage signature")
+	graphicsLibrary := atomicWordOf(u.Elem(), "graphicsLibrary")
+	if graphicsLibrary.Kind() != reflect.Int32 {
+		panic("noinit: Ebitengine UserInterface.graphicsLibrary changed type")
 	}
-	imageTypeRegular := reflect.New(newImage.Type().In(2)).Elem()
-	whiteImage := newImage.Call([]reflect.Value{
-		reflect.ValueOf(3),
-		reflect.ValueOf(3),
-		imageTypeRegular,
-	})[0]
+	atomic.StoreInt32((*int32)(unsafe.Pointer(graphicsLibrary.UnsafeAddr())), 1)
+
+	// The third argument is atlas.ImageTypeRegular, the zero value of a named
+	// int type.
+	whiteImage := uiNewImage(uPointer, 3, 3, 0)
+	if whiteImage == nil {
+		panic("noinit: Ebitengine NewImage returned nothing")
+	}
 
 	whiteImageField := requiredField(u.Elem(), "whiteImage")
-	if whiteImageField.Type() != whiteImage.Type() {
-		panic("noinit: Ebitengine UserInterface.whiteImage changed type")
-	}
-	reflect.NewAt(whiteImageField.Type(), unsafe.Pointer(whiteImageField.UnsafeAddr())).Elem().Set(whiteImage)
+	whiteImageValue := reflect.NewAt(whiteImageField.Type().Elem(), whiteImage)
+	verifyImage(whiteImageValue.Elem(), uPointer)
+	reflect.NewAt(whiteImageField.Type(), unsafe.Pointer(whiteImageField.UnsafeAddr())).Elem().Set(whiteImageValue)
 
 	pix := make([]byte, 4*3*3)
 	for i := range pix {
 		pix[i] = 0xff
 	}
-	requiredMethod(whiteImage, "WritePixels").Call([]reflect.Value{
-		reflect.ValueOf(pix),
-		reflect.ValueOf(image.Rect(0, 0, 3, 3)),
-	})
+	uiImageWritePixels(whiteImage, pix, image.Rect(0, 0, 3, 3))
 
-	theUI = u.UnsafePointer()
+	theUI = uPointer
 	runtime.KeepAlive(u)
+}
+
+// verifyImage checks that uiNewImage built the image it was asked for. An
+// Ebitengine signature change would leave the arguments misplaced, and this is
+// what notices before the damage spreads.
+func verifyImage(img reflect.Value, owner unsafe.Pointer) {
+	if requiredField(img, "width").Int() != 3 || requiredField(img, "height").Int() != 3 {
+		panic("noinit: Ebitengine NewImage ignored its size; unsupported Ebitengine version")
+	}
+	if requiredField(img, "ui").UnsafePointer() != owner {
+		panic("noinit: Ebitengine NewImage ignored its receiver; unsupported Ebitengine version")
+	}
+}
+
+// atomicWordOf returns the word a sync/atomic wrapper field stores. The
+// wrappers are a zero-size noCopy marker plus a single value; looking for the
+// value avoids depending on its name or on where the marker sits.
+//
+// Reaching for (*atomic.Int32).Store through reflect is not an option, for the
+// same reason the Ebitengine methods are linknamed.
+func atomicWordOf(owner reflect.Value, name string) reflect.Value {
+	field := requiredField(owner, name)
+	if field.Kind() != reflect.Struct {
+		panic("noinit: Ebitengine UserInterface." + name + " is not a sync/atomic value")
+	}
+
+	var word reflect.Value
+	for i := 0; i < field.NumField(); i++ {
+		f := field.Field(i)
+		if f.Type().Size() == 0 {
+			continue
+		}
+		if word.IsValid() {
+			panic("noinit: unexpected sync/atomic layout for " + name)
+		}
+		word = f
+	}
+	if !word.IsValid() {
+		panic("noinit: unexpected sync/atomic layout for " + name)
+	}
+	return word
 }
 
 func requiredField(value reflect.Value, name string) reflect.Value {
@@ -141,14 +242,6 @@ func requiredField(value reflect.Value, name string) reflect.Value {
 		panic("noinit: Ebitengine field not found: " + name)
 	}
 	return field
-}
-
-func requiredMethod(value reflect.Value, name string) reflect.Value {
-	method := value.MethodByName(name)
-	if !method.IsValid() {
-		panic("noinit: Ebitengine method not found: " + name)
-	}
-	return method
 }
 
 func userInterfaceType() reflect.Type {
