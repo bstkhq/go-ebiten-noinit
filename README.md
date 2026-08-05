@@ -1,10 +1,34 @@
 # go-ebiten-noinit
 
-`go-ebiten-noinit` lets a command-line process link a package which imports
-[Ebitengine](https://ebitengine.org) without initializing its graphical UI.
+Link [Ebitengine](https://ebitengine.org) into a command-line program without
+letting it open a display.
 
-Import it for its side effects from the program which only needs the indirect
-dependency:
+## The problem
+
+Ebitengine builds its user interface from an `init` function, before `main`
+runs. That is fine for a game. It is not fine for a CLI tool, a test binary or
+a server that happens to depend on a package that imports Ebitengine: the
+process dies on startup, on any machine without a display.
+
+```
+glfw: X11: The DISPLAY environment variable is missing: a platform-specific error occurred
+panic: glfw: The GLFW library is not initialized: the GLFW library is not initialized
+
+goroutine 1 [running]:
+github.com/hajimehoshi/ebiten/v2/internal/ui.init.0()
+	.../internal/ui/ui.go:101 +0x4e
+```
+
+There is no build tag or environment variable to turn it off.
+
+## Usage
+
+```console
+go get github.com/bstkhq/go-ebiten-noinit
+```
+
+Import it for its side effects from the program — not from a library — that
+pulls Ebitengine in indirectly:
 
 ```go
 import (
@@ -14,35 +38,60 @@ import (
 )
 ```
 
-The `github.com/bstkhq/go-ebiten-noinit` import path is part of the mechanism: it
-sorts before `github.com/hajimehoshi/ebiten/v2`, so Go initializes this package
-first. Renaming or publishing it under a path which sorts later would break
-that guarantee. The package must be linked together with Ebitengine; it is not
-useful as the only import in a binary.
-
-On Linux and BSD, importing this package is an explicit opt-in: it uses
-`go:linkname` to replace Ebitengine's `internal/ui` initializer in Go's
-`inittask` unconditionally. `DISPLAY` is deliberately ignored. The replacement
-creates only the minimal in-memory UI state needed by other package
-initializers and never initializes GLFW, X11, or a graphics driver. Other
-operating systems are untouched.
-
-This replaces the one-line change previously carried in the
-[erparts/ebiten fork](https://github.com/erparts/ebiten/commit/6011b342019d9cd2ccd6aa1abce065828746dcb2)
-without replacing the whole Ebitengine module.
+That is all. There is no API and nothing to call. `DISPLAY` is deliberately
+ignored: the import *is* the statement that this binary never wants a UI.
 
 ## Limits
 
-This is not a headless Ebitengine backend. A binary which imports this package
-must never call `ebiten.RunGame` or any API which needs the UI, even when
-`DISPLAY` is set. Do not import it from binaries which can run graphically. It
-is only for commands which link Ebitengine accidentally and never use it.
+**This is not a headless Ebitengine backend.** `ebiten.RunGame`, and anything
+else that needs the UI, must never be called. Nothing diagnoses it; the program
+faults on a nil pointer inside Ebitengine. Do not import this package from a
+binary that can run graphically.
 
-The link targets and `inittask` layout are compiler and Ebitengine internals.
-This module supports Ebitengine v2.9.9 and newer, including prereleases. It is
-currently checked against v2.9.9 and v2.10.0-alpha.11 with Go 1.26.5, and
-requires Go 1.24 or newer. Upgrading Ebitengine or Go should include running the
-subprocess test before release.
+Drawing still works as long as it only queues commands. Anything that has to
+talk to a GPU does not:
+
+```go
+img := ebiten.NewImage(4, 4)
+img.Fill(color.White)   // fine
+img.At(0, 0)            // panics: ui: ReadPixels cannot be called before the game starts
+```
+
+## Compatibility
+
+| GOOS                           | Behaviour                                 |
+| ------------------------------ | ----------------------------------------- |
+| `linux` (excluding Android)    | **Active** — UI initialization is skipped  |
+| `freebsd`, `netbsd`, `openbsd` | **Active** — UI initialization is skipped  |
+| everything else                | No-op — compiles and does nothing          |
+
+A no-op is not the same as being safe: Ebitengine drives GLFW on Windows and
+macOS too, and a headless binary hits the same problem there. Only Linux and
+BSD are addressed.
+
+|               | Ebitengine                              | Go                 |
+| ------------- | --------------------------------------- | ------------------ |
+| Supported     | `v2.8.x`, `v2.9.x`, `v2.10.0-alpha.x`   | 1.24, 1.25, 1.26   |
+| Not supported | `v2.7.x` and older                      | 1.23 and older     |
+
+Older Ebitengine refuses to start with a `noinit:` panic rather than silently
+opening a display. Older Go is rejected by `go.mod`.
+
+## How it works
+
+Go records each package's initializers in a compiler-generated `inittask`. This
+package reaches Ebitengine's with `go:linkname` and, before Ebitengine has run,
+swaps the pointer to its UI initializer for a replacement. The replacement
+builds the same `UserInterface` value Ebitengine would have, minus the call
+that initializes GLFW, X11 and a graphics driver.
+
+The import path is part of the mechanism: Go's linker breaks initialization
+ties by symbol name, and `github.com/bstkhq/…` sorts before
+`github.com/hajimehoshi/…`.
+
+[INTERNALS.md](INTERNALS.md) covers the rest — the ordering rules this relies
+on, why the replacement avoids reflection, and what happens when Ebitengine or
+Go moves underneath it.
 
 ## License
 

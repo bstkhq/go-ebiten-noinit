@@ -1,27 +1,31 @@
 // Package noinit lets a command-line program link Ebitengine on Linux or
 // BSD without initializing its graphical UI.
 //
-// Ebitengine initializes GLFW from an init function. Importing this package for
-// its side effects unconditionally replaces that function with a minimal,
+// Ebitengine initializes GLFW from an init function, so a binary which links it
+// through an indirect dependency dies on startup without a display. Importing
+// this package for its side effects replaces that function with a minimal,
 // non-graphical initializer:
 //
 //	import _ "github.com/bstkhq/go-ebiten-noinit"
 //
-// The import path is significant: it sorts before Ebitengine's import path, so
-// Go initializes this package first. Moving the package to an import path which
-// sorts after github.com/hajimehoshi/ebiten/v2 would break the mechanism.
+// There is nothing to call. DISPLAY is deliberately ignored: the import is an
+// explicit declaration that the binary never needs Ebitengine's UI.
 //
-// DISPLAY is deliberately ignored. Importing this package is an explicit
-// declaration that the binary never needs Ebitengine's UI. It changes nothing
-// on platforms where Ebitengine does not use X11.
+// This is not a headless renderer. After the UI initializer has been skipped,
+// RunGame and every other API which needs the UI must not be called; doing so
+// is not diagnosed and faults on a nil pointer inside Ebitengine. Do not import
+// this package from a binary which can run graphically.
 //
-// This package is deliberately only for binaries which happen to link
-// Ebitengine through an indirect dependency. Ebitengine has no headless
-// renderer: after its UI init has been skipped, RunGame and other UI APIs must
-// not be called. Do not import this package from a graphical binary.
+// Only the initializer which builds the UI is replaced. Ebitengine's others
+// still run, including the runtime.LockOSThread call which pins the main
+// goroutine to its thread for the life of the process.
 //
-// The implementation reaches into compiler-generated Ebitengine initialization
-// metadata with go:linkname. It supports Ebitengine v2.9.9 and newer and is
-// verified against v2.9.9 and v2.10.0-alpha.11. It can require an update when
-// either Ebitengine or Go changes that metadata.
+// The package is a no-op on other operating systems, which is not the same as
+// their being safe: Ebitengine drives GLFW on Windows and macOS too. It
+// supports Ebitengine v2.8.0 and newer and requires Go 1.24 or newer. Older
+// Ebitengine versions fail loudly at startup.
+//
+// The implementation depends on compiler, linker and Ebitengine internals.
+// INTERNALS.md in the repository describes them, and what to check when
+// upgrading either.
 package noinit
